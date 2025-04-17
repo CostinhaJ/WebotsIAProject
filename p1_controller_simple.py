@@ -2,134 +2,183 @@ import numpy as np
 from controller import Supervisor
 import random
 import math
-import numpy as np
+import matplotlib.pyplot as plt
 
-# Simulation parameters
-TIME_STEP = 5
-POPULATION_SIZE = 10
-PARENTS_KEEP = 3
-INPUT = 5
-HIDDEN = 4
-OUTPUT = 2
-GENOME_SIZE = (1+INPUT)*HIDDEN  + (HIDDEN+1)*OUTPUT
-GENERATIONS = 300
-MUTATION_RATE = 0.2
-MUTATION_SIZE = 0.05
-EVALUATION_TIME = 300  # Simulated seconds per individual
-RANGE = 5
+# ================= CONFIGURAÇÕES OTIMIZADAS =================
+TIME_STEP      = 64    # passo de física Webots (ms)
+POPULATION_SIZE= 20
+GENERATIONS    = 30
+PARENTS_KEEP   = 4
+MUTATION_RATE  = 0.2
+MUTATION_SIZE  = 0.15
+EVALUATION_TIME= 20    # segundos simulados
+MAX_SPEED      = 8.0
 
+INPUT_SIZE     = 5   # 2 chão + 3 frontais
+HIDDEN_SIZE    = 5
+OUTPUT_SIZE    = 2
+GENOME_SIZE    = (INPUT_SIZE+1)*HIDDEN_SIZE + (HIDDEN_SIZE+1)*OUTPUT_SIZE
 
-def random_orientation():
-    angle = np.random.uniform(0, 2 * np.pi)
-    return (0, 0, 1, angle)
-
-def random_position(min_radius, max_radius, z):
-    radius = np.random.uniform(min_radius, max_radius)
-    angle = random_orientation()
-    x = radius * np.cos(angle[3])
-    y = radius * np.sin(angle[3])
-    return (x, y, z)
-
-class Evolution:
+# ================= CONTROLLER =================
+class ThymioController:
     def __init__(self):
-        self.evaluation_start_time = 0
-        self.collision = False
+        self.sup            = Supervisor()
+        self.robot_node     = self.sup.getFromDef("ROBOT")
+        self.translation_f  = self.robot_node.getField("translation")
+        self.rotation_f     = self.robot_node.getField("rotation")
+        self.timestep       = int(self.sup.getBasicTimeStep())
 
-        # Supervisor to reset robot position
-        self.supervisor = Supervisor()
-        self.robot = self.supervisor.getSelf()
-   
-        self.robot_node = self.supervisor.getFromDef("ROBOT") 
-        self.translation_field = self.robot_node.getField("translation")
-        self.rotation_field = self.robot_node.getField("rotation")
-
-        self.timestep = int(self.supervisor.getBasicTimeStep()*TIME_STEP)
-        self.left_motor = self.supervisor.getDevice('motor.left')
-        self.right_motor = self.supervisor.getDevice('motor.right')
-
-        self.__ir_0 = self.supervisor.getDevice('prox.horizontal.0')
-        self.__ir_1 = self.supervisor.getDevice('prox.horizontal.1')
-        self.__ir_2 = self.supervisor.getDevice('prox.horizontal.2')
-        self.__ir_3 = self.supervisor.getDevice('prox.horizontal.3')
-        self.__ir_4 = self.supervisor.getDevice('prox.horizontal.4')
-        self.__ir_5 = self.supervisor.getDevice('prox.horizontal.5')
-        self.__ir_6 = self.supervisor.getDevice('prox.horizontal.6')
-        self.__ir_7 = self.supervisor.getDevice('prox.ground.0')
-        self.__ir_8 = self.supervisor.getDevice('prox.ground.1')
-
+        # motores
+        self.left_motor  = self.sup.getDevice('motor.left')
+        self.right_motor = self.sup.getDevice('motor.right')
         self.left_motor.setPosition(float('inf'))
         self.right_motor.setPosition(float('inf'))
 
-        self.__ir_0.enable(self.timestep)
-        self.__ir_1.enable(self.timestep)
-        self.__ir_2.enable(self.timestep)
-        self.__ir_3.enable(self.timestep)
-        self.__ir_4.enable(self.timestep)
-        self.__ir_5.enable(self.timestep)
-        self.__ir_6.enable(self.timestep)
-        self.__ir_7.enable(self.timestep)
-        self.__ir_8.enable(self.timestep)
+        # sensores
+        self.ground = [
+            self.sup.getDevice('prox.ground.0'),
+            self.sup.getDevice('prox.ground.1')
+        ]
+        self.front  = [
+            self.sup.getDevice('prox.horizontal.0'),
+            self.sup.getDevice('prox.horizontal.2'),
+            self.sup.getDevice('prox.horizontal.4'),
+        ]
+        for s in self.ground + self.front:
+            s.enable(self.timestep)
 
-        self.sensors = [self.__ir_0,self.__ir_2,self.__ir_4]
-        self.ground_sensors = [self.supervisor.getDevice(f'prox.ground.{i}') for i in range(2)]
-
-        self.__n = 0
-        self.prev_position = self.supervisor.getSelf().getPosition()
-        
-        
-   
-
-    def reset(self, seed=None, options=None):
-        
-        random_rotation = [0, 0, 1, np.random.uniform(0, 2 * np.pi)]
-        self.supervisor.getFromDef('ROBOT').getField('rotation').setSFRotation(random_rotation)
-        self.supervisor.getFromDef('ROBOT').getField('translation').setSFVec3f([0, 0, 0])
-        
+    def reset(self, fix_position=False):
+        # rotação apenas em torno do eixo vertical
+        yaw = 0.0 if fix_position else random.uniform(0, 2*math.pi)
+        self.rotation_f.setSFRotation([0,0,1,yaw])
+        # posição ligeiramente elevada
+        self.translation_f.setSFVec3f([0,0.03,0])
         self.left_motor.setVelocity(0)
         self.right_motor.setVelocity(0)
-        
+        self.sup.step(self.timestep)
+        # armazena posição inicial
+        self.prev_pos = self.robot_node.getPosition()
 
-    def runStep(self, weights):
-        
-        self.collision = bool(
-                self.__n > 10 and
-                (self.__ir_0.getValue()>4300 or 
-                self.__ir_1.getValue()>4300 or
-                self.__ir_2.getValue()>4300 or
-                self.__ir_3.getValue()>4300 or
-                self.__ir_4.getValue()>4300 or
-                self.__ir_5.getValue()>4300 or
-                self.__ir_6.getValue()>4300)
-            )
-        
-        ground_sensor_left = (self.ground_sensors[0].getValue()/1023 - .6)/.2>.3
-        ground_sensor_right = (self.ground_sensors[1].getValue()/1023 - .6)/.2>.3
+    def read_sensors(self):
+        # normaliza chão: preto ≈1, branco ≈0
+        ground_vals = [1 - (s.getValue()/1023.0) for s in self.ground]
+        # normaliza frontais: perto ≈1, longe ≈0 (max ~4096)
+        front_vals  = [min(s.getValue()/2000.0,1.0) for s in self.front]
+        return ground_vals + front_vals
 
-        left_speed =  ground_sensor_left * weights[0] + ground_sensor_right * weights[1] + weights[2]
-        right_speed = ground_sensor_left * weights[3] + ground_sensor_right * weights[4] + weights[5]
-        
-        self.left_motor.setVelocity(max(min(left_speed, 9), -9))
-        self.right_motor.setVelocity(max(min(right_speed, 9), -9))
+    def step(self, genome):
+        # lê sensores
+        inputs = self.read_sensors()
+        on_line = any(v > 0.5 for v in inputs[:2])
+        # detecta colisão se frontal ≳0.8
+        if any(v > 0.8 for v in inputs[2:]):
+            return False
 
-        self.supervisor.step(self.timestep)
+        # ANN feed‑forward
+        iv = np.array(inputs + [1.0])
+        w1 = np.array(genome[: (INPUT_SIZE+1)*HIDDEN_SIZE]).reshape((HIDDEN_SIZE, INPUT_SIZE+1))
+        w2 = np.array(genome[(INPUT_SIZE+1)*HIDDEN_SIZE:]).reshape((OUTPUT_SIZE, HIDDEN_SIZE+1))
+        h  = np.tanh(w1.dot(iv))
+        ov = np.tanh(w2.dot(np.concatenate([h,[1.0]])))
 
+        # calcula velocidades
+        left_v  = max(min(ov[0]*MAX_SPEED, MAX_SPEED), -MAX_SPEED)
+        right_v = max(min(ov[1]*MAX_SPEED, MAX_SPEED), -MAX_SPEED)
+        self.left_motor.setVelocity(left_v)
+        self.right_motor.setVelocity(right_v)
 
+        # avança simulação
+        self.sup.step(self.timestep)
 
-   
-    def run(self):
-        self.evaluation_start_time = self.supervisor.getTime()
-        weights = [1,1,1,1,1,2]
-        while self.supervisor.getTime() - self.evaluation_start_time < EVALUATION_TIME and not self.collision:
-            self.runStep(weights)
+        # calcula distância para fitness
+        curr = self.robot_node.getPosition()
+        dx, dz = curr[0]-self.prev_pos[0], curr[2]-self.prev_pos[2]
+        dist = math.hypot(dx, dz)
+        self.prev_pos = curr
 
+        return dist, on_line
 
-# Main evolutionary loop
-def main():
+    def evaluate(self, genome, fix_position=False):
+        self.reset(fix_position)
+        start = self.sup.getTime()
+        fitness = 0.0
+        line_time = 0.0
 
-    # Run the evolutionary algorithm
-    controller = Evolution()
-    controller.run()
+        while self.sup.getTime() - start < EVALUATION_TIME:
+            result = self.step(genome)
+            if result is False:
+                # colisão
+                fitness -= 20
+                break
+            dist, on_line = result
+            if on_line:
+                fitness += dist * 3 + 0.05
+                line_time += self.timestep/1000.0
+            else:
+                fitness += dist * 0.5
+        # bônus final por tempo na linha
+        fitness += line_time * 5.0
+        return fitness
+
+# ================= EVOLUÇÃO =================
+def run_evolution():
+    ctrl = ThymioController()
+    # população inicial (valores pequenos em [-1,1])
+    population = [np.random.uniform(-1,1,GENOME_SIZE).tolist()
+                  for _ in range(POPULATION_SIZE)]
+    best_genome = None
+    best_fitness= -1e9
+    history = []
+
+    print(f"=== Evolução: {GENERATIONS} gerações, pop={POPULATION_SIZE} ===")
+    for gen in range(1, GENERATIONS+1):
+        fitnesses = []
+        for i, ind in enumerate(population):
+            f = ctrl.evaluate(ind)
+            fitnesses.append(f)
+        # ordena
+        idx         = np.argsort(fitnesses)[::-1]
+        population  = [population[i] for i in idx]
+        fitnesses   = [fitnesses[i] for i in idx]
+        gen_best    = fitnesses[0]
+        history.append(gen_best)
+
+        if gen_best > best_fitness:
+            best_fitness = gen_best
+            best_genome  = population[0]
+
+        print(f"Ger {gen:02d}: best_gen={gen_best:.1f}, best_all={best_fitness:.1f}")
+
+        # elitismo
+        next_pop = population[:PARENTS_KEEP]
+        # crossover + mutação
+        while len(next_pop) < POPULATION_SIZE:
+            p1, p2 = random.sample(population[:PARENTS_KEEP],2)
+            # one‑point crossover
+            pt = random.randint(1,GENOME_SIZE-1)
+            child = p1[:pt] + p2[pt:]
+            # mutação
+            child = [g + np.random.normal(0,MUTATION_SIZE) if random.random()<MUTATION_RATE else g
+                     for g in child]
+            next_pop.append(child)
+        population = next_pop
+
+    # reavaliação robusta do melhor
+    print("\n=== Teste final do melhor indivíduo ===")
+    for i in range(5):
+        f = ctrl.evaluate(best_genome, fix_position=True)
+        print(f" Teste {i+1}: {f:.1f}")
+
+    # plot histórico
+    plt.plot(history, '-o')
+    plt.title("Melhor fitness por geração")
+    plt.xlabel("Geração")
+    plt.ylabel("Fitness")
+    plt.grid(True)
+    plt.savefig("fitness_evolution.png")
+    print("Gráfico salvo → fitness_evolution.png")
+
+    return best_genome
 
 if __name__ == "__main__":
-    main()
-
+    run_evolution()
